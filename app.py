@@ -316,17 +316,12 @@ Inheriting a model from someone who left the team is one of finance worst ritual
 # Cached heavy resources (loaded once, reused across reruns)
 # ──────────────────────────────────────────────────────────────────────
 
-@st.cache_resource(show_spinner="Loading embedding model...")
-def load_embedding_model():
-    from langchain_huggingface import HuggingFaceEmbeddings
-    return HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-
-
 @st.cache_resource(show_spinner="Building vector database...")
 def build_vector_store(_documents: tuple):
     """Chunk documents, embed them, and store in ChromaDB."""
     from langchain_text_splitters import RecursiveCharacterTextSplitter
-    from langchain_community.vectorstores import Chroma
+    import chromadb
+    from chromadb.utils import embedding_functions
 
     # --- Chunking ---
     splitter = RecursiveCharacterTextSplitter(
@@ -338,15 +333,26 @@ def build_vector_store(_documents: tuple):
     for doc in _documents:
         chunks.extend(splitter.split_text(doc))
 
-    embeddings = load_embedding_model()
+    # --- ONNX-based embeddings (lighter than PyTorch) ---
+    # Uses all-MiniLM-L6-v2 under the hood via ONNX Runtime
+    embedding_fn = embedding_functions.ONNXMiniLM_L6_V2()
 
     # --- Store in ChromaDB ---
-    vector_store = Chroma.from_texts(
-        texts=chunks,
-        embedding=embeddings,
-        collection_name="knowledge_base",
+    client = chromadb.Client()
+    # Reset collection if it exists (for clean rebuilds)
+    try:
+        client.delete_collection("knowledge_base")
+    except Exception:
+        pass
+
+    collection = client.create_collection(
+        name="knowledge_base",
+        embedding_function=embedding_fn,
     )
-    return vector_store, chunks
+    ids = [f"chunk_{i}" for i in range(len(chunks))]
+    collection.add(documents=chunks, ids=ids)
+
+    return collection, chunks
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -400,28 +406,32 @@ elif page == "Ask a question":
     vector_store, chunks = build_vector_store(tuple(DOCUMENTS))
 
     query = st.text_input(
-    "Your question",
-    placeholder="e.g. How do I write a better prompt?",
-)
+        "Your question",
+        placeholder="e.g. How do I write a better prompt?",
+    )
     num_results = st.slider("Number of results", 1, 10, 3)
 
     if query:
         with st.spinner("Searching..."):
-            results = vector_store.similarity_search_with_score(query, k=num_results)
+            results = vector_store.query(
+                query_texts=[query],
+                n_results=num_results,
+            )
 
-        st.subheader(f"Top {len(results)} results")
-        for i, (doc, score) in enumerate(results, 1):
+        documents = results["documents"][0]
+        distances = results["distances"][0]
+
+        st.subheader(f"Top {len(documents)} results")
+        for i, (doc_text, distance) in enumerate(zip(documents, distances), 1):
             # ChromaDB returns distance; lower = more similar
-            similarity = max(0, 1 - score)  # rough conversion
+            similarity = max(0, 1 - distance)
             with st.container():
                 st.markdown(f"**Result {i}** — relevance: `{similarity:.2f}`")
-                st.markdown(f"> {doc.page_content}")
+                st.markdown(f"> {doc_text}")
                 st.divider()
 
     st.markdown("---")
     st.caption("Powered by all-MiniLM-L6-v2 embeddings + ChromaDB")
-
-
 # ──────────────────────────────────────────────────────────────────────
 # EXPLORE CHUNKS PAGE
 # ──────────────────────────────────────────────────────────────────────
